@@ -1,0 +1,33 @@
+name: Benchmark Race
+
+on:
+  push:
+    branches: [ "main", "main-local", "master" ]
+  pull_request:
+    branches: [ "main", "main-local", "master" ]
+  workflow_dispatch:
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Create benchmark data folder
+        run: mkdir -p benchmark-data
+
+      - name: Generate random CNF
+        run: |
+          # 50 variables, 200 clauses, clause length 3
+          python3 benchmark/rnd-cnf-gen.py 50 200 3 > benchmark-data/test.cnf
+
+      - name: Run benchmark race
+        run: |
+          chmod +x race-incomplete.py
+          chmod +x solver.py
+          python3 race-incomplete.py benchmark-data solver.py
