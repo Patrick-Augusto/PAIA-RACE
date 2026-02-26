@@ -52,7 +52,7 @@ def walksat(num_vars, clauses, max_flips=50000, p=0.5):
         if random.random() < p:
             flip_var = abs(random.choice(clause))
         else:
-            flip_var = max(clause, key=lambda v: evaluate(clauses, {**assignment, abs(v): not assignment[abs(v)]}))
+            flip_var = abs(max(clause, key=lambda v: evaluate(clauses, {**assignment, abs(v): not assignment[abs(v)]})))
 
         flip_variable(assignment, flip_var)
 
