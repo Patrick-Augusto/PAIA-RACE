@@ -7,6 +7,64 @@ import networkx as nx
 import matplotlib.pyplot as plt
 
 
+def infer_graph_coloring_structure(num_vars, clauses):
+    """Infereix (num_nodes, num_colors) a partir de les clàusules ALO del generador rnd-graph-gen.py."""
+    positive_clauses = [
+        c for c in clauses
+        if c and all(lit > 0 for lit in c) and c == list(range(c[0], c[0] + len(c)))
+    ]
+
+    if not positive_clauses:
+        return None, None
+
+    num_colors = max(set(len(c) for c in positive_clauses), key=lambda k: sum(1 for c in positive_clauses if len(c) == k))
+    if num_colors <= 0 or num_vars % num_colors != 0:
+        return None, None
+
+    num_nodes = num_vars // num_colors
+    return num_nodes, num_colors
+
+
+def var_to_node_color(var, num_colors):
+    """Converteix un identificador de variable en (node, color) amb índex començant a 1."""
+    zero_based = var - 1
+    node = zero_based // num_colors + 1
+    color = zero_based % num_colors
+    return node, color
+
+
+def extract_coloring_solution(solution, num_nodes, num_colors):
+    """Extreu la coloració final de cada node a partir d'una assignació SAT."""
+    node_color = {}
+    for var, is_true in solution.items():
+        if not is_true:
+            continue
+        node, color = var_to_node_color(var, num_colors)
+        if 1 <= node <= num_nodes and node not in node_color:
+            node_color[node] = color
+
+    # Fallback defensiu en cas d'assignacions parcials
+    for node in range(1, num_nodes + 1):
+        node_color.setdefault(node, 0)
+
+    return node_color
+
+
+def extract_graph_edges(clauses, num_colors):
+    """Reconstrueix arestes del graf des de clàusules de tipus [-x_u_c, -x_v_c]."""
+    edges = set()
+    for clause in clauses:
+        if len(clause) != 2 or not all(lit < 0 for lit in clause):
+            continue
+
+        node1, _ = var_to_node_color(abs(clause[0]), num_colors)
+        node2, _ = var_to_node_color(abs(clause[1]), num_colors)
+        if node1 != node2:
+            edges.add(tuple(sorted((node1, node2))))
+
+    return edges
+
+
 def read_cnf(file_path):
     """ Llegeix un fitxer CNF i retorna les clàusules i el nombre de variables """
     clauses = []
@@ -46,29 +104,26 @@ def call_solver(cnf_file):
 
 
 def draw_graph(num_vars, clauses, solution, output_file="graph.png"):
-    """ Dibuixa el graf amb els valors de la solució utilitzant networkx i matplotlib """
+    """Dibuixa el graf utilitzant colors reals del problema de graph coloring."""
+    num_nodes, num_colors = infer_graph_coloring_structure(num_vars, clauses)
+    if num_nodes is None or num_colors is None:
+        print("No s'ha pogut inferir l'estructura de graph coloring del CNF.")
+        return
+
+    node_color_assignment = extract_coloring_solution(solution, num_nodes, num_colors)
+    edges = extract_graph_edges(clauses, num_colors)
+
     G = nx.Graph()
+    G.add_nodes_from(range(1, num_nodes + 1))
+    G.add_edges_from(edges)
 
-    # Afegir nodes amb color segons la solució
-    node_colors = []
-    for var in range(1, num_vars + 1):
-        G.add_node(var)
-        # Colors més agradables i moderns (Material Design) per marcar la veracitat
-        color = "#4CAF50" if solution.get(var, False) else "#F44336"
-        node_colors.append(color)
-
-    # Connectar nodes que comparteixen clàusules (mostra l'estructura real del problema)
-    for clause in clauses:
-        vars_in_clause = [abs(lit) for lit in clause if lit != 0]
-        for i in range(len(vars_in_clause)):
-            for j in range(i + 1, len(vars_in_clause)):
-                if vars_in_clause[i] != vars_in_clause[j]:
-                    G.add_edge(vars_in_clause[i], vars_in_clause[j])
+    palette = list(plt.cm.get_cmap("tab20", max(3, num_colors)).colors)
+    node_colors = [palette[node_color_assignment[node] % len(palette)] for node in G.nodes()]
 
     # Fallback: connectar seqüencialment si el fitxer no ens ha generat cap aresta
     if G.number_of_edges() == 0:
-        for var in range(1, num_vars):
-            G.add_edge(var, var + 1)
+        for node in range(1, num_nodes):
+            G.add_edge(node, node + 1)
 
     # Configuració de la figura
     plt.figure(figsize=(12, 9), facecolor="#F8F9FA")
@@ -79,8 +134,8 @@ def draw_graph(num_vars, clauses, solution, output_file="graph.png"):
     try:
         # Kamada-Kawai té molt bona estètica per grafs petits però falla si hi ha components desconnectats
         pos = nx.kamada_kawai_layout(G)
-    except:
-        pos = nx.spring_layout(G, seed=42, k=1.2/((num_vars)**0.5 if num_vars > 0 else 1))
+    except Exception:
+        pos = nx.spring_layout(G, seed=42, k=1.2 / ((num_nodes) ** 0.5 if num_nodes > 0 else 1))
 
     # Dibuixar les arestes del graf amb transparència
     nx.draw_networkx_edges(
@@ -91,7 +146,7 @@ def draw_graph(num_vars, clauses, solution, output_file="graph.png"):
     )
 
     # Ajust de mides per a millor visualització independent del tamany
-    node_size = max(500, min(2000, 30000 // max(1, num_vars)))
+    node_size = max(500, min(2000, 30000 // max(1, num_nodes)))
     font_size = max(9, min(14, int(node_size ** 0.5 * 0.35)))
 
     # Dibuixar els nodes amb vora blanca
@@ -113,13 +168,19 @@ def draw_graph(num_vars, clauses, solution, output_file="graph.png"):
     )
 
     # Ocultar eixos i afegir títol
-    plt.title("Estructura i Solució de les Variables (SAT)", fontsize=18, fontweight="bold", color="#333333", pad=20)
+    plt.title(
+        f"Graph Coloring SAT: {num_nodes} nodes, {num_colors} colors",
+        fontsize=18,
+        fontweight="bold",
+        color="#333333",
+        pad=20,
+    )
     plt.axis("off")
     plt.tight_layout()
 
     # Guardar i mostrar el graf (alta resolució)
     plt.savefig(output_file, dpi=300, bbox_inches="tight", facecolor="#F8F9FA")
-    print(f"Graf generat amb estats: {output_file}")
+    print(f"Graf generat amb coloració: {output_file}")
     plt.show()
 
 
