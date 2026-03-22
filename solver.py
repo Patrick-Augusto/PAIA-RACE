@@ -18,9 +18,18 @@ def read_cnf(file_path):
                 if len(parts) >= 3:
                     num_vars = int(parts[2])
                 continue
-            clause = [int(x) for x in line.split() if x != '0']
-            if clause:
-                clauses.append(clause)
+            lits = set()
+            taut = False
+            for x in line.split():
+                val = int(x)
+                if val == 0:
+                    continue
+                if -val in lits:
+                    taut = True
+                    break
+                lits.add(val)
+            if lits and not taut:
+                clauses.append(list(lits))
     return num_vars, clauses
 
 
@@ -106,6 +115,116 @@ def verify(assignment, clauses):
     return True
 
 
+def dpll_solve(num_vars, clauses, time_limit=3.0):
+    """Complete DPLL solver with unit propagation. Returns assignment list or None (UNSAT)."""
+    start = time.process_time()
+
+    def unit_propagate(assignment, clauses):
+        changed = True
+        while changed:
+            changed = False
+            new_clauses = []
+            for cl in clauses:
+                unsat_count = 0
+                sat = False
+                last_unassigned = None
+                for lit in cl:
+                    v = abs(lit)
+                    if assignment[v] == 0:  # unassigned
+                        last_unassigned = lit
+                        unsat_count += 1
+                    elif (lit > 0 and assignment[v] == 1) or (lit < 0 and assignment[v] == -1):
+                        sat = True
+                        break
+                    # else: literal is false, skip
+                if sat:
+                    continue
+                if unsat_count == 0:
+                    return None  # conflict
+                if unsat_count == 1:
+                    v = abs(last_unassigned)
+                    assignment[v] = 1 if last_unassigned > 0 else -1
+                    changed = True
+                else:
+                    new_clauses.append(cl)
+            clauses = new_clauses
+        return clauses
+
+    # assignment: 0=unassigned, 1=True, -1=False
+    assignment = [0] * (num_vars + 1)
+    stack = [(clauses, assignment[:], None, None)]  # (clauses, assignment, var, phase)
+
+    while stack:
+        if time.process_time() - start > time_limit:
+            return "TIMEOUT"
+
+        clauses, assignment, var, phase = stack.pop()
+
+        if var is not None:
+            assignment[var] = phase
+            # Simplify: remove sat clauses, shorten others
+            new_clauses = []
+            conflict = False
+            for cl in clauses:
+                sat = False
+                remaining = []
+                for lit in cl:
+                    v = abs(lit)
+                    if assignment[v] == 0:
+                        remaining.append(lit)
+                    elif (lit > 0 and assignment[v] == 1) or (lit < 0 and assignment[v] == -1):
+                        sat = True
+                        break
+                if sat:
+                    continue
+                if not remaining:
+                    conflict = True
+                    break
+                new_clauses.append(remaining)
+            if conflict:
+                continue
+            clauses = new_clauses
+
+        # Unit propagation
+        result = unit_propagate(assignment, clauses)
+        if result is None:
+            continue  # conflict, backtrack
+        clauses = result
+
+        if not clauses:
+            return assignment  # SAT
+
+        # Choose variable (VSIDS-like: pick most frequent in shortest clause)
+        min_len = len(clauses[0])
+        best_cl = clauses[0]
+        for cl in clauses:
+            if len(cl) < min_len:
+                min_len = len(cl)
+                best_cl = cl
+        branch_var = abs(best_cl[0])
+
+        # Count polarity preference
+        pos = 0
+        neg = 0
+        for cl in clauses:
+            for lit in cl:
+                if abs(lit) == branch_var:
+                    if lit > 0:
+                        pos += 1
+                    else:
+                        neg += 1
+
+        # Push both branches (second push = first tried due to stack LIFO)
+        if pos >= neg:
+            stack.append((clauses, assignment[:], branch_var, -1))  # try False second
+            stack.append((clauses, assignment[:], branch_var, 1))   # try True first
+        else:
+            stack.append((clauses, assignment[:], branch_var, 1))
+            stack.append((clauses, assignment[:], branch_var, -1))
+
+    return None  # UNSAT
+
+
 def solve(num_vars, clauses, max_time=4.5):
     """Novelty+ with clause weighting and adaptive noise."""
     if not clauses:
@@ -143,53 +262,88 @@ def solve(num_vars, clauses, max_time=4.5):
     best_u = nc + 1
     restart = 0
 
+    # Clause weights (PAWS-style) — kept across restarts to preserve learned info
+    w = [1] * nc
+
     while _time() - start < max_time:
         restart += 1
 
-        # Initialize assignment with polarity bias + diversification
+        # Adaptive restart length: short restarts early, longer later
+        if restart <= 4:
+            max_flips = 50000
+        elif restart <= 10:
+            max_flips = 100000
+        else:
+            max_flips = 200000
+
+        # Initialize assignment with diverse strategies
         a = [0] * (num_vars + 1)
-        if restart == 1:
+        strat = restart % 5
+        if strat == 1:
+            # Polarity bias
             for v in range(1, num_vars + 1):
                 a[v] = 1 if pol[v] >= 0 else 0
-        elif best_a is not None and restart % 3 != 0:
-            # Perturb best known assignment
+        elif strat == 2 and best_a is not None:
+            # Light perturbation of best (5%)
+            for v in range(1, num_vars + 1):
+                a[v] = best_a[v]
+                if _random() < 0.05:
+                    a[v] = 1 - a[v]
+        elif strat == 3 and best_a is not None:
+            # Heavier perturbation of best (15%)
             for v in range(1, num_vars + 1):
                 a[v] = best_a[v]
                 if _random() < 0.15:
                     a[v] = 1 - a[v]
+        elif strat == 4:
+            # Weighted greedy: pick value that satisfies more weighted clauses
+            for v in range(1, num_vars + 1):
+                sp = sum(w[i] for i in pos_in[v])
+                sn = sum(w[i] for i in neg_in[v])
+                a[v] = 1 if sp >= sn else 0
         else:
+            # Random
             for v in range(1, num_vars + 1):
                 a[v] = _randint(0, 1)
 
-        # Initialize sat_count and unsat tracking
+        # Initialize sat_count, critical variable, and unsat tracking
         sc = [0] * nc
+        crit = [0] * nc
         ul = []
         for i, cl in enumerate(clauses):
             c = 0
+            lv = 0
             for lit in cl:
-                if (lit > 0 and a[abs(lit)]) or (lit < 0 and not a[abs(lit)]):
+                v = abs(lit)
+                if (lit > 0 and a[v]) or (lit < 0 and not a[v]):
                     c += 1
+                    lv = v
             sc[i] = c
             if c == 0:
                 ul.append(i)
+            elif c == 1:
+                crit[i] = lv
 
         up = [-1] * nc
         for i, ci in enumerate(ul):
             up[ci] = i
 
-        # Clause weights (PAWS-style)
-        w = [1] * nc
+        # Initialize incremental break scores using current weights
+        break_w = [0] * (num_vars + 1)
+        for i in range(nc):
+            if sc[i] == 1:
+                break_w[crit[i]] += w[i]
 
         # Variable age for Novelty selection
         age = [0] * (num_vars + 1)
 
         # Adaptive walk probability
-        wp = 0.01
+        wp = 0.03
         p_nov = 0.3
         best_in_restart = len(ul)
         stale = 0
 
-        for flip in range(1, 500001):
+        for flip in range(1, max_flips + 1):
             if not ul:
                 return a
 
@@ -212,12 +366,12 @@ def solve(num_vars, clauses, max_time=4.5):
             else:
                 stale += 1
 
-            # Adapt walk probability
-            if stale > 1000:
-                wp = min(0.5, wp + 0.01)
+            # Faster noise adaptation
+            if stale > 500:
+                wp = min(0.5, wp + 0.02)
                 stale = 0
             elif stale == 0:
-                wp = max(0.01, wp - 0.005)
+                wp = max(0.01, wp - 0.01)
 
             # Select random unsatisfied clause
             ci = _choice(ul)
@@ -227,18 +381,14 @@ def solve(num_vars, clauses, max_time=4.5):
                 # Random walk step
                 bv = abs(_choice(cl))
             else:
-                # Novelty+: find best and second-best by weighted break count
+                # Novelty+: find best and second-best by break score
                 b1s, b1v = nc + 1, -1
                 b2s, b2v = nc + 1, -1
                 ya, yv = -1, -1
 
                 for lit in cl:
                     v = abs(lit)
-                    bc = 0
-                    rel = pos_in[v] if a[v] else neg_in[v]
-                    for rc in rel:
-                        if sc[rc] == 1:
-                            bc += w[rc]
+                    bc = break_w[v]
 
                     if bc < b1s:
                         b2s, b2v = b1s, b1v
@@ -267,22 +417,36 @@ def solve(num_vars, clauses, max_time=4.5):
             # Update clauses where flipped literal becomes false
             tf = pos_in[bv] if ov else neg_in[bv]
             for rc in tf:
-                sc[rc] -= 1
-                if sc[rc] == 0:
+                sc_old = sc[rc]
+                if sc_old == 1:
+                    break_w[crit[rc]] -= w[rc]
                     up[rc] = len(ul)
                     ul.append(rc)
+                elif sc_old == 2:
+                    for lit2 in clauses[rc]:
+                        v2 = abs(lit2)
+                        if v2 != bv and ((lit2 > 0 and a[v2]) or (lit2 < 0 and not a[v2])):
+                            crit[rc] = v2
+                            break_w[v2] += w[rc]
+                            break
+                sc[rc] = sc_old - 1
 
             # Update clauses where flipped literal becomes true
             tt = neg_in[bv] if ov else pos_in[bv]
             for rc in tt:
-                if sc[rc] == 0:
+                sc_old = sc[rc]
+                if sc_old == 0:
+                    crit[rc] = bv
+                    break_w[bv] += w[rc]
                     p = up[rc]
                     last = ul[-1]
                     ul[p] = last
                     up[last] = p
                     ul.pop()
                     up[rc] = -1
-                sc[rc] += 1
+                elif sc_old == 1:
+                    break_w[crit[rc]] -= w[rc]
+                sc[rc] = sc_old + 1
 
             # Clause weight update: increase weights of unsat clauses
             if flip & 255 == 0 and ul:
@@ -292,6 +456,11 @@ def solve(num_vars, clauses, max_time=4.5):
                 if flip & 16383 == 0:
                     for i in range(nc):
                         w[i] = (w[i] + 1) >> 1
+                    # Recalculate break scores after weight smoothing
+                    break_w = [0] * (num_vars + 1)
+                    for i in range(nc):
+                        if sc[i] == 1:
+                            break_w[crit[i]] += w[i]
 
     return best_a
 
@@ -314,7 +483,7 @@ def main():
 
     if fixed is None:
         # Contradiction detected by unit propagation — formula is UNSAT
-        # Exit silently (timeout penalty is far better than wrong SATISFIABLE)
+        print("s UNSATISFIABLE", flush=True)
         return
 
     if not simplified:
@@ -341,7 +510,37 @@ def main():
             if v > mx:
                 mx = v
 
-    sol = solve(mx, simplified)
+    # Try DPLL complete solver for small instances (can prove UNSAT)
+    global_start = time.process_time()
+    if mx <= 100:
+        dpll_result = dpll_solve(mx, simplified, time_limit=1.0)
+    else:
+        dpll_result = "TIMEOUT"
+
+    if dpll_result is None:
+        # DPLL proved UNSAT
+        print("s UNSATISFIABLE", flush=True)
+        return
+    elif dpll_result != "TIMEOUT":
+        # DPLL found SAT solution
+        fa = [0] * (num_vars + 1)
+        for v in range(1, num_vars + 1):
+            if v in fixed:
+                fa[v] = 1 if fixed[v] else 0
+            elif v <= mx:
+                fa[v] = 1 if dpll_result[v] == 1 else 0
+        if verify(fa, orig_clauses):
+            print("s SATISFIABLE", flush=True)
+            res = []
+            for v in range(1, num_vars + 1):
+                res.append(str(v if fa[v] else -v))
+            print("v " + " ".join(res) + " 0", flush=True)
+            return
+
+    # Fall back to local search (Novelty+) with remaining time
+    elapsed = time.process_time() - global_start
+    remaining = max(0.5, 4.5 - elapsed)
+    sol = solve(mx, simplified, max_time=remaining)
 
     if sol:
         # Build full assignment merging preprocessing + search
